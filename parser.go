@@ -573,8 +573,16 @@ func parseProfileHTML(body, handle, profileURL string) shared.ChannelSnapshot {
 		Raw:       map[string]interface{}{"source": "camoufox_html"},
 	}
 
-	// Find every <script>…</script>; concatenate. Then ream all { ... }
-	// chunks ≥200 chars and try to decode each.
+	// Strategy 1: visible-text counters that Facebook renders into the DOM.
+	// Profile top-card prints `<strong>N</strong>&nbsp;— друзья` (RU) or
+	// `<strong>N</strong> friends` / `<strong>N</strong> followers`. This
+	// surface is the most stable — JSON blobs change shape weekly.
+	if applyVisibleCounters(&snap, body) {
+		// keep going below so the JSON walker can still enrich Raw with name etc.
+	}
+
+	// Strategy 2: deep-walk every JSON blob in <script>. Picks up
+	// fan_count/followers_count for business Pages and any leftover signals.
 	scripts := regexp.MustCompile(`(?is)<script[^>]*>(.*?)</script>`).FindAllStringSubmatch(body, -1)
 	for _, m := range scripts {
 		if len(m) < 2 {
@@ -588,7 +596,20 @@ func parseProfileHTML(body, handle, profileURL string) shared.ChannelSnapshot {
 		if t := extractTitle(body); t != "" {
 			// FB titles look like "Display Name | Facebook" — strip suffix.
 			t = strings.TrimSuffix(t, " | Facebook")
+			// Strip notification-count prefix like "(3) " that FB prepends
+			// when the logged-in account has unread items.
+			t = regexp.MustCompile(`^\(\d+\)\s+`).ReplaceAllString(t, "")
 			snap.Raw["name"] = strings.TrimSpace(t)
+		}
+	}
+
+	// Final fan_count fallback (legacy Likes counter for Pages). Runs only
+	// once at the top level so it can't beat followers_count due to map
+	// iteration order inside walkJSONForCounters.
+	if snap.Followers == 0 {
+		if fc, ok := snap.Raw["fan_count"].(int64); ok && fc > 0 {
+			snap.Followers = fc
+			snap.Raw["followers_key"] = "fan_count"
 		}
 	}
 
@@ -596,6 +617,89 @@ func parseProfileHTML(body, handle, profileURL string) shared.ChannelSnapshot {
 		snap.Raw["fetch_note"] = "no follower count surfaced (personal profile may not expose one publicly)"
 	}
 	return snap
+}
+
+// applyVisibleCounters scrapes the rendered top-card counters. Patterns
+// covered (locale-aware):
+//   - <strong>289</strong>&nbsp;— друзья              (RU personal profile)
+//   - <strong>289</strong>&nbsp;friends               (EN personal profile)
+//   - <strong>1.2K</strong>&nbsp;followers            (EN with follower count enabled)
+//   - 1,234 followers / 1,234 подписчиков             (alt formats)
+//
+// Friends and followers are both audience-ish; we prefer followers when both
+// are present (since that's the broader "public reach" signal), else fall
+// back to friends. Both numbers are persisted to Raw separately.
+var reFBVisibleCounter = regexp.MustCompile(`(?i)<strong>([\d,.kKmM\xa0 ]+)</strong>(?:&nbsp;|\s)*(?:[—-]\s*)?(друз|friend|follower|подписч)`)
+
+func applyVisibleCounters(snap *shared.ChannelSnapshot, body string) bool {
+	matches := reFBVisibleCounter.FindAllStringSubmatch(body, -1)
+	if len(matches) == 0 {
+		return false
+	}
+	var friends, followers int64
+	for _, m := range matches {
+		n := parseCompactNumber(m[1])
+		if n == 0 {
+			continue
+		}
+		switch strings.ToLower(m[2]) {
+		case "друз", "friend":
+			if n > friends {
+				friends = n
+			}
+		case "follower", "подписч":
+			if n > followers {
+				followers = n
+			}
+		}
+	}
+	if friends == 0 && followers == 0 {
+		return false
+	}
+	if followers > 0 {
+		snap.Followers = followers
+	} else {
+		snap.Followers = friends
+	}
+	if friends > 0 {
+		snap.Raw["friend_count"] = friends
+	}
+	if followers > 0 {
+		snap.Raw["follower_count"] = followers
+	}
+	snap.Raw["extracted_via"] = "visible_counters"
+	return true
+}
+
+// parseCompactNumber handles "1,234", "1.2K", "5M", "1 234" (NBSP/space).
+func parseCompactNumber(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	mul := 1.0
+	last := s[len(s)-1]
+	switch last {
+	case 'k', 'K':
+		mul = 1_000
+		s = s[:len(s)-1]
+	case 'm', 'M':
+		mul = 1_000_000
+		s = s[:len(s)-1]
+	}
+	// strip thousands separators (comma, NBSP, regular space).
+	clean := strings.Map(func(r rune) rune {
+		switch r {
+		case ',', ' ', ' ':
+			return -1
+		}
+		return r
+	}, s)
+	f, err := strconv.ParseFloat(clean, 64)
+	if err != nil {
+		return 0
+	}
+	return int64(f * mul)
 }
 
 // walkScriptForCounters extracts JSON chunks from a single <script> body
@@ -732,14 +836,9 @@ func walkJSONForCounters(snap *shared.ChannelSnapshot, node interface{}) {
 			walkJSONForCounters(snap, item)
 		}
 	}
-
-	// Final fallback: if no follower count but a fan count showed up, use that.
-	if snap.Followers == 0 {
-		if fc, ok := snap.Raw["fan_count"].(int64); ok && fc > 0 {
-			snap.Followers = fc
-			snap.Raw["followers_key"] = "fan_count"
-		}
-	}
+	// (fan_count → Followers fallback moved to parseProfileHTML — running
+	// it inside recursion let fan_count beat followers_count when Go's
+	// random map iteration happened to visit fan_count first.)
 }
 
 // extractTitle pulls the contents of <title>...</title>. Falls back to "".
