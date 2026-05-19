@@ -2,7 +2,9 @@ package parser
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -202,18 +204,156 @@ func TestFetchChannel_5xxTransient(t *testing.T) {
 	}
 }
 
-// TestFetchChannel_NoTokenWithCamoufox: no AccessToken, CamoufoxURL set →
-// parser routes to fetchViaCamoufox which returns the documented stub error;
-// the wrapping error should be ErrAuth and mention "not implemented".
-func TestFetchChannel_NoTokenWithCamoufox(t *testing.T) {
-	p := New(Config{CamoufoxURL: "ws://camoufox:3000"})
+// TestFetchChannel_NoTokenWithUnreachableCamoufox: no AccessToken, CamoufoxURL
+// points at an unresolvable host → fetchViaCamoufox bubbles transport error,
+// wrapped as ErrAuth.
+func TestFetchChannel_NoTokenWithUnreachableCamoufox(t *testing.T) {
+	p := New(Config{CamoufoxURL: "http://camoufox-not-here.invalid:9/"})
 	_, err := p.FetchChannel(context.Background(), "example")
 	if !errors.Is(err, shared.ErrAuth) {
 		t.Fatalf("want ErrAuth, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "not implemented") {
-		t.Errorf("expected error to mention 'not implemented'; got %q", err)
+}
+
+// TestFetchChannel_ViaCamoufox: no token, working camoufox wrapper that
+// returns HTML embedding a follower count. Parser must extract the counter
+// and return Followers > 0.
+func TestFetchChannel_ViaCamoufox(t *testing.T) {
+	// HTML mimics the shape of an authenticated Facebook profile page:
+	// a <script> with an embedded JSON blob carrying followers_count.
+	const fbHTML = `<!doctype html><html><head><title>Evgeniy Soloviov | Facebook</title></head>
+<body>
+<script type="application/json">
+{
+  "require": [["RelayPrefetchedStreamCache","next",[],["profile_intro_card_xxxxxxxxxxxxxx",
+    {
+      "data": {
+        "user": {
+          "id": "100000123456789",
+          "name": "Evgeniy Soloviov",
+          "followers_count": 12345,
+          "fan_count": 11000
+        }
+      }
+    }
+  ]]]
+}
+</script>
+</body></html>`
+
+	var gotPath string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"html": ` + jsonQuote(fbHTML) + `,
+			"status": 200,
+			"final_url": "https://www.facebook.com/soloviov.evgeniy/",
+			"title": "Evgeniy Soloviov | Facebook",
+			"cookies_present": true
+		}`))
+	}))
+	defer srv.Close()
+
+	p := New(Config{
+		HTTPClient:  srv.Client(),
+		CamoufoxURL: srv.URL,
+	})
+	snap, err := p.FetchChannel(context.Background(), "soloviov.evgeniy")
+	if err != nil {
+		t.Fatalf("FetchChannel via camoufox: %v", err)
 	}
+	if gotPath != "/fetch" {
+		t.Errorf("path = %q, want /fetch", gotPath)
+	}
+	var reqBody struct {
+		URL     string `json:"url"`
+		Profile string `json:"profile"`
+	}
+	if err := json.Unmarshal(gotBody, &reqBody); err != nil {
+		t.Fatalf("body not JSON: %v (raw=%s)", err, string(gotBody))
+	}
+	if reqBody.Profile != "facebook" {
+		t.Errorf("camoufox profile = %q, want facebook", reqBody.Profile)
+	}
+	if !strings.Contains(reqBody.URL, "soloviov.evgeniy") {
+		t.Errorf("camoufox url = %q", reqBody.URL)
+	}
+	if snap.Followers != 12345 {
+		t.Errorf("followers = %d, want 12345", snap.Followers)
+	}
+	if name, _ := snap.Raw["name"].(string); name != "Evgeniy Soloviov" {
+		t.Errorf("name = %v, want Evgeniy Soloviov", snap.Raw["name"])
+	}
+	if got, _ := snap.Raw["source"].(string); got != "camoufox_html" {
+		t.Errorf("source = %v, want camoufox_html", snap.Raw["source"])
+	}
+	if snap.URL != "https://www.facebook.com/soloviov.evgeniy/" {
+		t.Errorf("url = %s", snap.URL)
+	}
+}
+
+// TestFetchChannel_ViaCamoufox_NoCounter: page renders fine but no follower
+// count is exposed. We surface Followers=0 + fetch_note WITHOUT an error.
+func TestFetchChannel_ViaCamoufox_NoCounter(t *testing.T) {
+	const fbHTML = `<!doctype html><html><head><title>Anonymous User | Facebook</title></head>
+<body><div>page rendered, no counters</div></body></html>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{
+			"html": ` + jsonQuote(fbHTML) + `,
+			"status": 200,
+			"final_url": "https://www.facebook.com/anon/",
+			"title": "Anonymous User | Facebook",
+			"cookies_present": true
+		}`))
+	}))
+	defer srv.Close()
+
+	p := New(Config{
+		HTTPClient:  srv.Client(),
+		CamoufoxURL: srv.URL,
+	})
+	snap, err := p.FetchChannel(context.Background(), "anon")
+	if err != nil {
+		t.Fatalf("expected soft success, got err=%v", err)
+	}
+	if snap.Followers != 0 {
+		t.Errorf("followers = %d, want 0", snap.Followers)
+	}
+	if _, ok := snap.Raw["fetch_note"]; !ok {
+		t.Errorf("expected fetch_note diagnostic, got Raw=%v", snap.Raw)
+	}
+	if name, _ := snap.Raw["name"].(string); name != "Anonymous User" {
+		t.Errorf("name (from title) = %v, want Anonymous User", snap.Raw["name"])
+	}
+}
+
+// TestFetchChannel_ViaCamoufox_502: camoufox returned 502 / error envelope →
+// ErrAuth (because that's how camoufox failures surface to FetchChannel).
+func TestFetchChannel_ViaCamoufox_502(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte(`{"error":"navigation timeout"}`))
+	}))
+	defer srv.Close()
+
+	p := New(Config{
+		HTTPClient:  srv.Client(),
+		CamoufoxURL: srv.URL,
+	})
+	_, err := p.FetchChannel(context.Background(), "x")
+	if !errors.Is(err, shared.ErrAuth) {
+		t.Fatalf("want ErrAuth, got %v", err)
+	}
+}
+
+// jsonQuote returns s encoded as a JSON string literal suitable for inlining.
+func jsonQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 // TestFetchChannel_NoTokenNoCamoufox: neither configured → ErrAuth with the
@@ -285,16 +425,12 @@ func TestFetchRecentPosts_NoTokenNoCamoufox(t *testing.T) {
 	}
 }
 
-// TestFetchViaCamoufox_Direct: low-level branch coverage for the connection
-// layer. When CamoufoxURL is empty we get "not configured", when set we get
-// "not implemented".
-func TestFetchViaCamoufox_Direct(t *testing.T) {
+// TestFetchViaCamoufox_NotConfigured: low-level branch — empty CamoufoxURL
+// returns the canonical "not configured" error.
+func TestFetchViaCamoufox_NotConfigured(t *testing.T) {
 	p := New(Config{})
-	if _, err := p.fetchViaCamoufox(context.Background(), "https://x"); err == nil || !strings.Contains(err.Error(), "not configured") {
+	_, _, err := p.fetchViaCamoufox(context.Background(), "https://x")
+	if err == nil || !strings.Contains(err.Error(), "not configured") {
 		t.Errorf("empty CamoufoxURL: got %v, want 'not configured'", err)
-	}
-	p2 := New(Config{CamoufoxURL: "ws://x:1"})
-	if _, err := p2.fetchViaCamoufox(context.Background(), "https://x"); err == nil || !strings.Contains(err.Error(), "not implemented") {
-		t.Errorf("set CamoufoxURL: got %v, want 'not implemented'", err)
 	}
 }

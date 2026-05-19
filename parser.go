@@ -22,6 +22,7 @@
 package parser
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -124,12 +126,13 @@ func (p *FacebookParser) FetchRecentPosts(ctx context.Context, handle string, si
 		return p.fetchPostsGraph(ctx, handle, since)
 	}
 	if p.cfg.CamoufoxURL != "" {
-		_, err := p.fetchViaCamoufox(ctx, p.profileURL(handle))
-		if err != nil {
+		// Personal profiles don't expose a structured post stream the way
+		// Page /posts does. We render the profile so the wrapper at least
+		// proves auth works, but we don't try to extract individual posts
+		// from the resulting HTML — that's a follow-up.
+		if _, _, err := p.fetchViaCamoufox(ctx, p.profileURL(handle)); err != nil {
 			return nil, fmt.Errorf("%w: %v", shared.ErrAuth, err)
 		}
-		// If a real camoufox path ever returns nil, we'd parse HTML here.
-		// For now this branch is unreachable.
 		return nil, nil
 	}
 	return nil, fmt.Errorf("%w: set FACEBOOK_ACCESS_TOKEN or CAMOUFOX_URL", shared.ErrAuth)
@@ -428,46 +431,353 @@ func mapGraphError(status int, e *graphError) error {
 
 // --- camoufox ---------------------------------------------------------------
 
+// camoufoxFetchRequest mirrors the JSON body accepted by POST /fetch on the
+// camoufox HTTP wrapper (see camoufox/server.py).
+type camoufoxFetchRequest struct {
+	URL             string `json:"url"`
+	Profile         string `json:"profile"`
+	WaitForSelector string `json:"wait_for_selector,omitempty"`
+	TimeoutMS       int    `json:"timeout_ms,omitempty"`
+}
+
+// camoufoxFetchResponse mirrors the response envelope.
+type camoufoxFetchResponse struct {
+	HTML           string `json:"html"`
+	Status         int    `json:"status"`
+	FinalURL       string `json:"final_url"`
+	Title          string `json:"title"`
+	CookiesPresent bool   `json:"cookies_present"`
+	Error          string `json:"error,omitempty"`
+}
+
 // fetchChannelCamoufox is the camoufox-side equivalent of fetchChannelGraph.
-// It calls fetchViaCamoufox to obtain the HTML and would parse counters out
-// of it once the real implementation lands.
+// It POSTs the personal-profile URL to the camoufox wrapper, gets back the
+// fully-rendered HTML (post-login), and walks the embedded JSON blobs for a
+// follower count.
+//
+// Personal Facebook profiles do not always expose a public follower count,
+// even when authenticated. When no counter is found we return a snapshot
+// with Followers=0 plus a Raw["fetch_note"] diagnostic — *not* an error —
+// because the parent scheduler should record "we successfully reached the
+// page; counter not surfaced" as a real data point.
 func (p *FacebookParser) fetchChannelCamoufox(ctx context.Context, handle string) (shared.ChannelSnapshot, error) {
-	_, err := p.fetchViaCamoufox(ctx, p.profileURL(handle))
+	target := p.profileURL(handle)
+	html, finalURL, err := p.fetchViaCamoufox(ctx, target)
 	if err != nil {
 		return shared.ChannelSnapshot{}, fmt.Errorf("%w: %v", shared.ErrAuth, err)
 	}
-	// Unreachable until fetchViaCamoufox is implemented. When it is, parse the
-	// returned HTML into a ChannelSnapshot here.
-	return shared.ChannelSnapshot{}, fmt.Errorf("%w: camoufox returned no HTML", shared.ErrAuth)
+
+	snap := parseProfileHTML(string(html), handle, target)
+	if finalURL != "" {
+		snap.URL = finalURL
+	}
+	return snap, nil
 }
 
-// fetchViaCamoufox is the connection layer for the eventual CDP-based fetch.
+// fetchViaCamoufox POSTs the target URL to the camoufox wrapper, returns the
+// rendered HTML body and the final URL after redirects.
 //
-// Contract:
-//   - If Config.CamoufoxURL is empty, return errors.New("camoufox not
-//     configured") so callers can map to ErrAuth.
-//   - Otherwise, return errors.New("camoufox path not implemented") — the
-//     branching is wired (FetchChannel routes here) but the Playwright/CDP
-//     client is intentionally deferred to a follow-up.
-//
-// TODO: implement using github.com/playwright-community/playwright-go or a
-// minimal chromedp connection. Suggested shape:
-//
-//	pw, err := playwright.Run()
-//	browser, err := pw.Chromium.ConnectOverCDP(p.cfg.CamoufoxURL)
-//	page, err := browser.NewPage()
-//	_, err = page.Goto(targetURL, …)
-//	html, err := page.Content()
-//	return []byte(html), nil
-//
-// Once it returns real HTML, fetchChannelCamoufox can parse it the same way
-// fetchChannelGraph parses the API response (extract fan_count /
-// follower_count from the embedded JSON blobs).
-func (p *FacebookParser) fetchViaCamoufox(ctx context.Context, targetURL string) ([]byte, error) {
+// Network/transport failures and 5xx from the wrapper map to ErrTransient so
+// the scheduler retries them. 4xx from the wrapper (e.g. invalid profile
+// name) propagate as plain errors.
+func (p *FacebookParser) fetchViaCamoufox(ctx context.Context, targetURL string) ([]byte, string, error) {
 	if p.cfg.CamoufoxURL == "" {
-		return nil, errors.New("camoufox not configured")
+		return nil, "", errors.New("camoufox not configured")
 	}
-	_ = ctx
-	_ = targetURL
-	return nil, errors.New("camoufox path not implemented")
+
+	reqBody, err := json.Marshal(camoufoxFetchRequest{
+		URL:             targetURL,
+		Profile:         "facebook",
+		WaitForSelector: "body",
+		TimeoutMS:       20_000,
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: marshal camoufox request: %v", shared.ErrTransient, err)
+	}
+
+	endpoint := strings.TrimRight(p.cfg.CamoufoxURL, "/") + "/fetch"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: build camoufox request: %v", shared.ErrTransient, err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := p.cfg.HTTPClient.Do(req)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, "", err
+		}
+		return nil, "", fmt.Errorf("%w: camoufox: %v", shared.ErrTransient, err)
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: read camoufox body: %v", shared.ErrTransient, err)
+	}
+
+	var parsed camoufoxFetchResponse
+	if jerr := json.Unmarshal(raw, &parsed); jerr != nil {
+		return nil, "", fmt.Errorf("%w: parse camoufox response (http %d): %v", shared.ErrTransient, resp.StatusCode, jerr)
+	}
+	if resp.StatusCode >= 500 || resp.StatusCode == http.StatusBadGateway {
+		msg := parsed.Error
+		if msg == "" {
+			msg = fmt.Sprintf("http %d", resp.StatusCode)
+		}
+		return nil, "", fmt.Errorf("%w: camoufox: %s", shared.ErrTransient, msg)
+	}
+	if resp.StatusCode >= 400 {
+		msg := parsed.Error
+		if msg == "" {
+			msg = fmt.Sprintf("http %d", resp.StatusCode)
+		}
+		return nil, "", fmt.Errorf("camoufox: %s", msg)
+	}
+	if parsed.HTML == "" {
+		return nil, "", fmt.Errorf("%w: camoufox returned empty HTML", shared.ErrTransient)
+	}
+	return []byte(parsed.HTML), parsed.FinalURL, nil
+}
+
+// --- HTML extraction for the camoufox path ---------------------------------
+
+// reFollowerKey matches any JSON key that looks like a follower count:
+//
+//	followers_count, follower_count, followersCount, followerCount,
+//	num_followers, profile_follower_count, …
+//
+// We deliberately keep this case-insensitive and end-anchored so we don't
+// match unrelated suffixes like "...follower_count_format" or "follow_count"
+// from some unrelated edge.
+var reFollowerKey = regexp.MustCompile(`(?i)follow(?:er)?s?_count$|(?i)follow(?:er)?sCount$|(?i)followerCount$`)
+
+// reFanKey covers the legacy "Likes" counter still seen on some Pages.
+var reFanKey = regexp.MustCompile(`(?i)^fan_count$|(?i)^fanCount$`)
+
+// (no top-level regex needed — we extract balanced JSON via scanBalancedJSON)
+
+// parseProfileHTML attempts to extract a follower count and display name
+// from a fully-rendered Facebook profile page. Strategy: locate every
+// `<script>...</script>` payload, JSON-decode any chunk that looks JSON-ish,
+// and deep-walk for known keys. If nothing matches we return a soft success
+// (Followers=0 + Raw["fetch_note"]).
+func parseProfileHTML(body, handle, profileURL string) shared.ChannelSnapshot {
+	now := time.Now().UTC()
+	snap := shared.ChannelSnapshot{
+		Platform:  shared.PlatformFacebook,
+		Handle:    handle,
+		URL:       profileURL,
+		FetchedAt: now,
+		Raw:       map[string]interface{}{"source": "camoufox_html"},
+	}
+
+	// Find every <script>…</script>; concatenate. Then ream all { ... }
+	// chunks ≥200 chars and try to decode each.
+	scripts := regexp.MustCompile(`(?is)<script[^>]*>(.*?)</script>`).FindAllStringSubmatch(body, -1)
+	for _, m := range scripts {
+		if len(m) < 2 {
+			continue
+		}
+		walkScriptForCounters(&snap, m[1])
+	}
+
+	// Best-effort display name from <title>. Useful when no JSON blobs matched.
+	if name, ok := snap.Raw["name"].(string); !ok || name == "" {
+		if t := extractTitle(body); t != "" {
+			// FB titles look like "Display Name | Facebook" — strip suffix.
+			t = strings.TrimSuffix(t, " | Facebook")
+			snap.Raw["name"] = strings.TrimSpace(t)
+		}
+	}
+
+	if snap.Followers == 0 {
+		snap.Raw["fetch_note"] = "no follower count surfaced (personal profile may not expose one publicly)"
+	}
+	return snap
+}
+
+// walkScriptForCounters extracts JSON chunks from a single <script> body
+// (balanced {…} / […]) and decodes each. The deep-walker mutates snap.
+//
+// We try every {…} or […] that *can* be balanced. Facebook scripts embed
+// many small JSON blobs separated by JS punctuation; we don't try to be
+// clever, we just attempt every potential start position and let the JSON
+// decoder reject invalid ones.
+func walkScriptForCounters(snap *shared.ChannelSnapshot, scriptBody string) {
+	for _, blob := range scanBalancedJSON(scriptBody) {
+		var obj interface{}
+		dec := json.NewDecoder(strings.NewReader(blob))
+		dec.UseNumber()
+		if err := dec.Decode(&obj); err != nil {
+			continue
+		}
+		walkJSONForCounters(snap, obj)
+	}
+}
+
+// scanBalancedJSON walks s and returns every balanced {…} or […] starting at
+// a top-level `{` / `[`. Strings (with escapes) are tracked so braces inside
+// quoted strings don't terminate the scan. Worst-case O(n²) on adversarial
+// input but in practice limited by the size of FB's embedded blobs.
+func scanBalancedJSON(s string) []string {
+	var out []string
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c != '{' && c != '[' {
+			i++
+			continue
+		}
+		end := matchBalanced(s, i)
+		if end > i {
+			blob := s[i : end+1]
+			// Heuristic: only keep blobs that contain a key we care about.
+			// Saves the JSON decoder a lot of work on tiny `{}` chunks.
+			low := strings.ToLower(blob)
+			if strings.Contains(low, "follow") || strings.Contains(low, "fan_count") || strings.Contains(low, "fancount") || strings.Contains(low, "\"name\"") {
+				out = append(out, blob)
+			}
+			i = end + 1
+		} else {
+			i++
+		}
+	}
+	return out
+}
+
+// matchBalanced returns the index of the bracket that closes the one at
+// start, or -1 if unbalanced / runs off the end.
+func matchBalanced(s string, start int) int {
+	open := s[start]
+	var close byte
+	switch open {
+	case '{':
+		close = '}'
+	case '[':
+		close = ']'
+	default:
+		return -1
+	}
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inStr {
+			if esc {
+				esc = false
+				continue
+			}
+			if c == '\\' {
+				esc = true
+				continue
+			}
+			if c == '"' {
+				inStr = false
+			}
+			continue
+		}
+		if c == '"' {
+			inStr = true
+			continue
+		}
+		if c == open {
+			depth++
+		} else if c == close {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// walkJSONForCounters descends maps and slices looking for follower/fan
+// counter keys and a few interesting strings (name).
+func walkJSONForCounters(snap *shared.ChannelSnapshot, node interface{}) {
+	switch v := node.(type) {
+	case map[string]interface{}:
+		for k, val := range v {
+			// Strings of interest.
+			if (k == "name" || k == "display_name" || k == "title") {
+				if s, ok := val.(string); ok && s != "" {
+					if _, exists := snap.Raw["name"]; !exists {
+						snap.Raw["name"] = s
+					}
+				}
+			}
+			// Followers.
+			if reFollowerKey.MatchString(k) {
+				if n, ok := numericField(val); ok && snap.Followers == 0 {
+					snap.Followers = n
+					snap.Raw["followers_key"] = k
+				}
+			}
+			// Fan count (legacy Likes); only used if no follower count.
+			if reFanKey.MatchString(k) {
+				if n, ok := numericField(val); ok {
+					if _, exists := snap.Raw["fan_count"]; !exists {
+						snap.Raw["fan_count"] = n
+					}
+				}
+			}
+			// Recurse.
+			walkJSONForCounters(snap, val)
+		}
+	case []interface{}:
+		for _, item := range v {
+			walkJSONForCounters(snap, item)
+		}
+	}
+
+	// Final fallback: if no follower count but a fan count showed up, use that.
+	if snap.Followers == 0 {
+		if fc, ok := snap.Raw["fan_count"].(int64); ok && fc > 0 {
+			snap.Followers = fc
+			snap.Raw["followers_key"] = "fan_count"
+		}
+	}
+}
+
+// extractTitle pulls the contents of <title>...</title>. Falls back to "".
+func extractTitle(body string) string {
+	re := regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	m := re.FindStringSubmatch(body)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+// numericField coerces a JSON-ish value to int64. Mirrors the LinkedIn
+// helper. Handles json.Number (because we configured UseNumber on the
+// decoder), float64, int, string with optional commas.
+func numericField(v interface{}) (int64, bool) {
+	switch x := v.(type) {
+	case json.Number:
+		if n, err := x.Int64(); err == nil {
+			return n, true
+		}
+		if f, err := x.Float64(); err == nil {
+			return int64(f), true
+		}
+	case float64:
+		return int64(x), true
+	case int:
+		return int64(x), true
+	case int64:
+		return x, true
+	case string:
+		s := strings.ReplaceAll(strings.TrimSpace(x), ",", "")
+		if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return n, true
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			return int64(f), true
+		}
+	}
+	return 0, false
 }
