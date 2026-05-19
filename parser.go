@@ -629,7 +629,12 @@ func parseProfileHTML(body, handle, profileURL string) shared.ChannelSnapshot {
 // Friends and followers are both audience-ish; we prefer followers when both
 // are present (since that's the broader "public reach" signal), else fall
 // back to friends. Both numbers are persisted to Raw separately.
-var reFBVisibleCounter = regexp.MustCompile(`(?i)<strong>([\d,.kKmM\xa0 ]+)</strong>(?:&nbsp;|\s)*(?:[—-]\s*)?(друз|friend|follower|подписч)`)
+// Note: Facebook's <strong> tag carries dozens of obfuscated CSS classes
+// (e.g. `<strong class="html-strong xdj266r x14z9mp …">289</strong>`), so
+// we permit any attributes inside the opening tag. The separator between
+// the number and the label can be a literal em-dash, en-dash, hyphen, or
+// nothing at all, optionally surrounded by &nbsp; and whitespace.
+var reFBVisibleCounter = regexp.MustCompile(`(?i)<strong[^>]*>([\d,.kKmM\xa0 ]+)</strong>(?:&nbsp;|\s)*(?:—|–|-)?\s*(друз|friend|follower|подписч)`)
 
 func applyVisibleCounters(snap *shared.ChannelSnapshot, body string) bool {
 	matches := reFBVisibleCounter.FindAllStringSubmatch(body, -1)
