@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	shared "github.com/suenot/w-popularity-shared"
+	shared "github.com/suenot/socials-auto"
 )
 
 // rewriteRT redirects every request whose URL starts with graphPrefix to the

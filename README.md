@@ -1,4 +1,4 @@
-# w-popularity-parser-facebook
+# facebook-auto
 
 `facebook` parser for [w_popularity](https://github.com/suenot/w-popularity).
 
@@ -108,7 +108,7 @@ For full details see
 ## Usage
 
 ```go
-import parser "github.com/suenot/w-popularity-parser-facebook"
+import parser "github.com/suenot/facebook-auto"
 
 p := parser.New(parser.Config{
     AccessToken: os.Getenv("FACEBOOK_ACCESS_TOKEN"),

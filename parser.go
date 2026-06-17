@@ -35,7 +35,7 @@ import (
 	"strings"
 	"time"
 
-	shared "github.com/suenot/w-popularity-shared"
+	shared "github.com/suenot/socials-auto"
 )
 
 // defaultGraphAPI is Facebook's Graph API root. Override via Config.GraphAPIURL
@@ -78,7 +78,7 @@ func New(cfg Config) *FacebookParser {
 		cfg.HTTPTimeout = 15 * time.Second
 	}
 	if cfg.UserAgent == "" {
-		cfg.UserAgent = "w-popularity-parser-facebook/1.0"
+		cfg.UserAgent = "facebook-auto/1.0"
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Timeout: cfg.HTTPTimeout}
